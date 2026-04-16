@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V8
+.Trashes
+.AppleDouble
+.LSOverride
+
+# SQLite databases (don't commit actual DB files)
+*.db
+*.sqlite
+*.sqlite3
+
+# PHP config with local paths (optional: remove if you want to commit config)
+# config.php
+
+# Logs
+*.log
+
+# Backup exports
+*.sql
+*.csv
