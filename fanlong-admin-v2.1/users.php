@@ -74,10 +74,12 @@ if (in_array($action, ['view','edit','add'])) {
 
 // 用户列表
 $users = []; $rank_list = [];
-$stat_fields_list = ['stat_face','stat_charm','stat_intel','stat_biz','stat_talk','stat_body','stat_art','stat_obed'];
+$stat_fields_list = getVisibleStatFields(); // 只取对玩家可见的属性字段
 if ($action === 'list') {
+    // 动态拼接 total_stats，仅统计可见属性
+    $total_sql = implode('+', array_map(fn($sf)=>"COALESCE(s.$sf,0)", $stat_fields_list));
     $users = $db->query("SELECT u.id,u.uid,u.name,u.currency,u.created_at,
-        COALESCE(s.stat_face,0)+COALESCE(s.stat_charm,0)+COALESCE(s.stat_intel,0)+COALESCE(s.stat_biz,0)+COALESCE(s.stat_talk,0)+COALESCE(s.stat_body,0)+COALESCE(s.stat_art,0)+COALESCE(s.stat_obed,0) AS total_stats
+        ($total_sql) AS total_stats
         FROM users u LEFT JOIN user_stats s ON u.id=s.user_id ORDER BY u.created_at DESC")->fetchAll();
 
     // ——— 排行榜：实战属性（基础 + 装备加成）———
@@ -89,36 +91,36 @@ if ($action === 'list') {
     foreach ($all_item_rows as $ai) {
         $item_stats_map[$ai['name']] = safeJsonDecode($ai['stats'] ?: '{}');
     }
-    // 属性中文名 → 英文键 反向映射（物品 stats 存中文键）
+    // 属性中文名 → 英文键 反向映射（ALL_STAT_FIELDS 全集，装备可能包含隐藏属性）
     $stat_cn_map_list = [];
-    foreach ($stat_fields_list as $sf) { $stat_cn_map_list[t($sf, $sf)] = $sf; }
+    foreach (ALL_STAT_FIELDS as $sf) { $stat_cn_map_list[t($sf, $sf)] = $sf; }
     // 每个用户的基础属性
     $user_base_map = [];
     foreach ($all_stats_rows as $as) {
         $user_base_map[$as['user_id']] = $as;
     }
-    // 每个用户的装备加成合计
+    // 每个用户的装备加成合计（全字段跟踪，排行只取可见部分求和）
     $user_bonus_map = [];
     foreach ($all_equip_rows as $ae) {
-        $bonus = array_fill_keys($stat_fields_list, 0);
+        $bonus = array_fill_keys(ALL_STAT_FIELDS, 0);
         foreach (['hair','top','bottom','head','neck','inner1','inner2','acc1','acc2','acc3','acc4'] as $sl) {
             $iname = $ae[$sl] ?? null;
             if (!$iname || !isset($item_stats_map[$iname])) continue;
             foreach ($item_stats_map[$iname] as $ikey => $ival) {
-                $canon = $stat_cn_map_list[$ikey] ?? (in_array($ikey, $stat_fields_list) ? $ikey : null);
+                $canon = $stat_cn_map_list[$ikey] ?? (in_array($ikey, ALL_STAT_FIELDS) ? $ikey : null);
                 if ($canon) $bonus[$canon] += intval($ival);
             }
         }
         $user_bonus_map[$ae['user_id']] = $bonus;
     }
-    // 构建排行列表
+    // 构建排行列表（合计仅取可见属性）
     $user_name_map = array_column($users, 'name', 'id');
     foreach ($users as $u) {
         $uid   = $u['id'];
         $base  = $user_base_map[$uid]  ?? null;
-        $bonus = $user_bonus_map[$uid] ?? array_fill_keys($stat_fields_list, 0);
+        $bonus = $user_bonus_map[$uid] ?? array_fill_keys(ALL_STAT_FIELDS, 0);
         $base_total  = array_sum(array_map(fn($sf)=>intval($base[$sf]??0), $stat_fields_list));
-        $bonus_total = array_sum($bonus);
+        $bonus_total = array_sum(array_map(fn($sf)=>$bonus[$sf]??0, $stat_fields_list));
         $rank_list[] = [
             'id'          => $uid,
             'name'        => $u['name'] ?? $uid,
@@ -283,17 +285,16 @@ $lim  = safeJsonDecode($edit_user['limits']);
 $stats_r = $db->prepare("SELECT * FROM user_stats WHERE user_id=?"); $stats_r->execute([$edit_user['id']]); $stats_row=$stats_r->fetch();
 $equip_r = $db->prepare("SELECT * FROM user_equip WHERE user_id=?"); $equip_r->execute([$edit_user['id']]); $equip_row=$equip_r->fetch();
 $bag_r   = $db->prepare("SELECT item_name,count FROM user_bag WHERE user_id=? ORDER BY item_name"); $bag_r->execute([$edit_user['id']]); $bag_items=$bag_r->fetchAll();
-$stat_fields=['stat_face','stat_charm','stat_intel','stat_biz','stat_talk','stat_body','stat_art','stat_obed'];
+$stat_fields = getVisibleStatFields(); // 只取可见属性用于展示和合计
 $slot_fields=['hair','top','bottom','head','neck','inner1','inner2','acc1','acc2','acc3','acc4'];
 
-// ——— 属性中文名 → 英文键 反向映射（物品 stats 存的是中文键）———
+// ——— 属性中文名 → 英文键 反向映射（全字段，装备可能含隐藏属性）———
 $stat_cn_map = [];
-foreach ($stat_fields as $sf) { $stat_cn_map[t($sf, $sf)] = $sf; }
+foreach (ALL_STAT_FIELDS as $sf) { $stat_cn_map[t($sf, $sf)] = $sf; }
 
-// ——— 计算装备加成 ———
-$equip_bonus = array_fill_keys($stat_fields, 0);
+// ——— 计算装备加成（全字段跟踪，显示时只用可见字段）———
+$equip_bonus = array_fill_keys(ALL_STAT_FIELDS, 0);
 if ($equip_row) {
-    // 统计每件物品出现次数（同一装备可穿多槽，如家族徽章×3，需乘以数量）
     $equipped_counts = [];
     foreach ($slot_fields as $sl) {
         $n = $equip_row[$sl] ?? null;
@@ -310,14 +311,15 @@ if ($equip_row) {
             $istats = safeJsonDecode($itm['stats'] ?: '{}');
             $multiplier = $equipped_counts[$itm['name']] ?? 1;
             foreach ($istats as $ikey => $ival) {
-                // ikey 可能是中文（"颜值"）或英文（"stat_face"），统一转为英文键
-                $canon = $stat_cn_map[$ikey] ?? (in_array($ikey, $stat_fields) ? $ikey : null);
+                $canon = $stat_cn_map[$ikey] ?? (in_array($ikey, ALL_STAT_FIELDS) ? $ikey : null);
                 if ($canon) $equip_bonus[$canon] += intval($ival) * $multiplier;
             }
         }
     }
 }
-$has_bonus = (max($equip_bonus) > 0 || min($equip_bonus) < 0);
+// has_bonus：只看可见属性有无加成
+$has_bonus = false;
+foreach ($stat_fields as $sf) { if (($equip_bonus[$sf]??0) != 0) { $has_bonus = true; break; } }
 ?>
 <div class="d-flex justify-content-between align-items-center mb-4">
   <div></div>
@@ -357,10 +359,21 @@ $has_bonus = (max($equip_bonus) > 0 || min($equip_bonus) < 0);
     <div class="card">
       <div class="card-header"><i class="fas fa-shirt me-2"></i>当前装备</div>
       <div class="card-body">
-        <?php foreach($slot_fields as $slot): ?>
-        <?php $item_on=$equip_row[$slot]??null; if(!$item_on) continue; ?>
-        <div class="d-flex justify-content-between mb-1 small">
-          <span class="text-muted"><?php echo t($slot,$slot); ?></span>
+        <?php
+        $_slot_vis = getSlotFieldsVisibility();
+        foreach($slot_fields as $slot):
+            $item_on  = $equip_row[$slot] ?? null;
+            if(!$item_on) continue; // 空槽不展示
+            // is_hidden: 1=可见, 0=隐藏；若 term 不存在则默认可见
+            $_sv = $_slot_vis[$slot] ?? 1;
+        ?>
+        <div class="d-flex justify-content-between align-items-center mb-1 small <?php echo !$_sv ? 'opacity-50' : ''; ?>">
+          <span class="text-muted d-flex align-items-center gap-1">
+            <?php echo htmlspecialchars(tSlot($slot, $slot)); ?>
+            <?php if(!$_sv): ?>
+            <span class="badge text-bg-warning" style="font-size:.65rem;font-weight:500">隐藏槽</span>
+            <?php endif; ?>
+          </span>
           <span class="fw-semibold"><?php echo htmlspecialchars($item_on); ?></span>
         </div>
         <?php endforeach; ?>
@@ -417,7 +430,7 @@ $has_bonus = (max($equip_bonus) > 0 || min($equip_bonus) < 0);
         <div class="border-top pt-2 mt-1 small">
           <?php
           $base_sum  = array_sum(array_map(fn($sf)=>intval($stats_row[$sf]??0), $stat_fields));
-          $bonus_sum = array_sum($equip_bonus);
+          $bonus_sum = array_sum(array_map(fn($sf)=>$equip_bonus[$sf]??0, $stat_fields));
           $total_sum = $base_sum + $bonus_sum;
           ?>
           <div class="d-flex justify-content-between text-muted mb-1">
@@ -456,9 +469,21 @@ $has_bonus = (max($equip_bonus) > 0 || min($equip_bonus) < 0);
     <div class="card">
       <div class="card-header"><i class="fas fa-file-lines me-2"></i>档案信息</div>
       <div class="card-body">
-        <?php foreach($prof as $k=>$v): ?>
-        <div class="d-flex justify-content-between border-bottom pb-1 mb-1 small">
-          <span class="text-muted"><?php echo htmlspecialchars(tAuto($k, $k)); ?></span>
+        <?php
+        $_prof_vis = getProfileFieldsVisibility();
+        foreach($prof as $k=>$v):
+            $_label   = tAuto($k, $k);
+            // is_hidden: 1=可见, 0=隐藏；若 term 不存在则默认可见
+            // 先按原始键 $k 查（中文键/英文后缀都能命中），再按翻译后标签查
+            $_visible = $_prof_vis[$k] ?? $_prof_vis[$_label] ?? 1;
+        ?>
+        <div class="d-flex justify-content-between align-items-center border-bottom pb-1 mb-1 small <?php echo !$_visible ? 'opacity-50' : ''; ?>">
+          <span class="text-muted d-flex align-items-center gap-1">
+            <?php echo htmlspecialchars($_label); ?>
+            <?php if(!$_visible): ?>
+            <span class="badge text-bg-warning" style="font-size:.65rem;font-weight:500">对玩家隐藏</span>
+            <?php endif; ?>
+          </span>
           <span><?php echo htmlspecialchars(is_array($v)?json_encode($v,JSON_UNESCAPED_UNICODE):strval($v)); ?></span>
         </div>
         <?php endforeach; ?>

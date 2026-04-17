@@ -285,6 +285,66 @@ function tSlot($key, $fallback = '') {
 }
 
 // ====================================================================
+// 可见属性字段（尊重 game_terms.is_hidden 配置）
+// ====================================================================
+const ALL_STAT_FIELDS = ['stat_face','stat_charm','stat_intel','stat_biz','stat_talk','stat_body','stat_art','stat_obed'];
+
+/**
+ * 返回 is_hidden=1（对玩家可见）的属性字段数组。
+ * 若 game_terms 中一条 stat_* 都未配置，回退返回全部 8 个（兼容新装库）。
+ */
+function getVisibleStatFields() {
+    static $cache = null;
+    if ($cache !== null) return $cache;
+    try {
+        $rows = getDB()->query(
+            "SELECT key FROM game_terms WHERE key LIKE 'stat_%' AND is_hidden=1"
+        )->fetchAll(PDO::FETCH_COLUMN, 0);
+        $visible = array_values(array_intersect(ALL_STAT_FIELDS, $rows));
+        $cache = !empty($visible) ? $visible : ALL_STAT_FIELDS;
+    } catch (Exception $e) {
+        $cache = ALL_STAT_FIELDS;
+    }
+    return $cache;
+}
+
+/**
+ * 返回档案字段的可见性映射：["中文字段名" => is_hidden(1=可见,0=隐藏)]
+ * 用于 view 页判断 profile JSON 里每个字段是否对玩家可见。
+ */
+function getProfileFieldsVisibility() {
+    static $cache = null;
+    if ($cache !== null) return $cache;
+    try {
+        $rows = getDB()->query(
+            "SELECT key, text, is_hidden FROM game_terms WHERE key LIKE 'profile_%'"
+        )->fetchAll();
+        $cache = [];
+        foreach ($rows as $row) {
+            $cache[$row['text']] = $row['is_hidden'];                 // by Chinese text (常见情况)
+            $cache[substr($row['key'], 8)] = $row['is_hidden'];       // by key suffix, e.g. "sex" from "profile_sex"
+        }
+    } catch (Exception $e) { $cache = []; }
+    return $cache;
+}
+
+/**
+ * 返回装备槽位的可见性映射：["slot_code" => is_hidden(1=可见,0=隐藏)]
+ * slot_code 是 hair/top/bottom 等，对应 game_terms 里的 slot_* 键。
+ */
+function getSlotFieldsVisibility() {
+    static $cache = null;
+    if ($cache !== null) return $cache;
+    try {
+        $rows = getDB()->query(
+            "SELECT REPLACE(key,'slot_','') AS slot_code, is_hidden FROM game_terms WHERE key LIKE 'slot_%'"
+        )->fetchAll();
+        $cache = array_column($rows, 'is_hidden', 'slot_code');
+    } catch (Exception $e) { $cache = []; }
+    return $cache;
+}
+
+// ====================================================================
 // 物品类型标准映射（数据库中无 game_terms 条目时的回退）
 // ====================================================================
 function getItemTypeMap() {
