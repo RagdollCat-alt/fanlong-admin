@@ -846,7 +846,7 @@ pre code { background: transparent !important; }
     </ul>
     <?php endif; ?>
 
-    <?php if(can('items')||can('families')||can('family_rules')||can('fund_types')||can('fund_holdings')||can('item_instances')||can('auction_history')||can('family_logs')): ?>
+    <?php if(can('items')||can('families')||can('family_rules')||can('activities')||can('fund_types')||can('fund_holdings')||can('item_instances')||can('auction_history')||can('family_logs')): ?>
     <div class="sb-section">游戏数据</div>
     <ul class="list-unstyled mb-0">
       <?php if(can('items')): ?>
@@ -864,6 +864,10 @@ pre code { background: transparent !important; }
       <?php if(can('drama_archives')): ?>
       <li class="sb-item"><a href="drama_archives.php" class="<?php echo $cur==='drama_archives.php'?'active':''; ?>">
         <i class="fas fa-book-open sb-icon"></i><span class="sb-label">剧情档案</span></a></li>
+      <?php endif; ?>
+      <?php if(can('activities')): ?>
+      <li class="sb-item"><a href="activities.php" class="<?php echo $cur==='activities.php'?'active':''; ?>">
+        <i class="fas fa-calendar-days sb-icon"></i><span class="sb-label">活动管理</span></a></li>
       <?php endif; ?>
       <?php if(can('fund_types')): ?>
       <li class="sb-item"><a href="fund_types.php" class="<?php echo $cur==='fund_types.php'?'active':''; ?>">
