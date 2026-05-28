@@ -67,11 +67,34 @@ function defaultActivity($id = '') {
             'enabled' => false,
             'max_draws_per_user' => 5,
             'reward' => ['type' => 'stat', 'stat_key' => 'random', 'amount_mode' => 'fixed', 'amount' => 1, 'min' => 1, 'max' => 1],
+            'guess_reward_pool' => [
+                'enabled' => true,
+                'draw_mode' => 'weighted_random',
+                'items' => [
+                    ['id' => 'p001', 'name' => '随机属性', 'type' => 'stat', 'stat_key' => 'random', 'amount_mode' => 'fixed', 'amount' => 1, 'min' => 1, 'max' => 1, 'weight' => 100, 'enabled' => true]
+                ]
+            ],
             'riddles' => []
+        ],
+        'text_pools' => [
+            'lantern_signs' => ['name' => '灯签库', 'items' => []]
+        ],
+        'lantern_task' => [
+            'enabled' => true,
+            'review_notify_group_id' => '',
+            'review_admin_ids' => [],
+            'expire_pending_on_close' => true
         ],
         'field_prompt' => ['max_draws_per_user' => 2],
         'servant_assignment' => ['enabled' => false],
-        'fields' => []
+        'fields' => [
+            '默认场域' => [
+                'summary' => '',
+                'plots' => [],
+                'stats' => [],
+                'prompts' => []
+            ]
+        ]
     ];
 }
 
@@ -80,6 +103,9 @@ function defaultState($activity_id) {
         'activity_id' => $activity_id,
         'riddle_users' => [],
         'riddle_draw_counts' => [],
+        'reward_records' => [],
+        'lantern_tasks' => [],
+        'penalty_records' => [],
         'prompt_users' => [],
         'servant_pool' => [],
         'servant_assignments' => [],
@@ -87,6 +113,9 @@ function defaultState($activity_id) {
         'records' => [],
         'next_application_id' => 1,
         'next_record_id' => 1,
+        'next_reward_record_id' => 1,
+        'next_lantern_task_id' => 1,
+        'next_penalty_id' => 1,
     ];
 }
 
@@ -109,7 +138,7 @@ function readActivityState($activity_id) {
     $state = readJsonFile($path, null);
     if (!$state) {
         $legacy = readJsonFile(LEGACY_STATE_JSON, null);
-        if ($legacy && (($legacy['activity_id'] ?? '') === $activity_id)) {
+        if ($legacy && (empty($legacy['activity_id']) || (($legacy['activity_id'] ?? '') === $activity_id))) {
             $state = $legacy;
         }
     }
@@ -146,6 +175,8 @@ function countStateRows($activity_id) {
     foreach (($state['records'] ?? []) as $r) $records += count($r['entries'] ?? []);
     return [
         'riddles' => count($state['riddle_users'] ?? []),
+        'rewards' => count($state['reward_records'] ?? []),
+        'lantern_tasks' => count($state['lantern_tasks'] ?? []),
         'prompts' => count($state['prompt_users'] ?? []),
         'servants' => count($state['servant_pool'] ?? []),
         'assignments' => count($state['servant_assignments'] ?? []),
@@ -314,6 +345,106 @@ function normalizeGuessReward($reward) {
     ], $reward);
 }
 
+function normalizeRewardPoolItemFromArrays($i, $data) {
+    $id = trim($data['id'][$i] ?? '');
+    $name = trim($data['name'][$i] ?? '');
+    $type = $data['type'][$i] ?? 'stat';
+    if ($id === '' && $name === '') return null;
+    if ($id === '') $id = 'p' . str_pad((string)($i + 1), 3, '0', STR_PAD_LEFT);
+    if ($name === '') $name = $id;
+    if (!in_array($type, ['stat', 'currency', 'item', 'text'], true)) $type = 'stat';
+    $mode = $data['amount_mode'][$i] ?? 'fixed';
+    if (!in_array($mode, ['fixed', 'random'], true)) $mode = 'fixed';
+    $item = [
+        'id' => preg_replace('/[^A-Za-z0-9_\-]/', '', $id) ?: ('p_' . time() . '_' . ($i + 1)),
+        'name' => $name,
+        'type' => $type,
+        'weight' => max(0, intval($data['weight'][$i] ?? 100)),
+        'enabled' => !empty($data['enabled'][$i]),
+        'amount_mode' => $mode,
+        'amount' => max(0, intval($data['amount'][$i] ?? 1)),
+        'min' => max(0, intval($data['min'][$i] ?? 1)),
+        'max' => max(0, intval($data['max'][$i] ?? 1)),
+    ];
+    if ($item['max'] < $item['min']) {
+        $tmp = $item['min'];
+        $item['min'] = $item['max'];
+        $item['max'] = $tmp;
+    }
+    if ($type === 'stat') {
+        $statKey = $data['stat_key'][$i] ?? 'random';
+        $item['stat_key'] = in_array($statKey, array_merge(['random'], ALL_STAT_FIELDS), true) ? $statKey : 'random';
+    } elseif ($type === 'currency') {
+        $currencyKey = $data['currency_key'][$i] ?? 'yuCoin';
+        $item['currency_key'] = in_array($currencyKey, ['yuCoin', 'reputation'], true) ? $currencyKey : 'yuCoin';
+    } elseif ($type === 'item') {
+        $item['item_name'] = trim($data['item_name'][$i] ?? '');
+    } elseif ($type === 'text') {
+        $item['text_pool_id'] = trim($data['text_pool_id'][$i] ?? '');
+    }
+    return $item;
+}
+
+function normalizeRewardPoolFromPost() {
+    $data = $_POST['pool'] ?? [];
+    $rows = max(
+        count($data['id'] ?? []),
+        count($data['name'] ?? []),
+        count($data['type'] ?? [])
+    );
+    $items = [];
+    $used = [];
+    for ($i = 0; $i < $rows; $i++) {
+        if (!empty($data['delete'][$i])) continue;
+        $item = normalizeRewardPoolItemFromArrays($i, $data);
+        if (!$item) continue;
+        $base = $item['id'];
+        $id = $base;
+        $n = 2;
+        while (isset($used[$id])) {
+            $id = $base . '_' . $n;
+            $n++;
+        }
+        $item['id'] = $id;
+        $used[$id] = true;
+        $items[] = $item;
+    }
+    if (empty($items)) {
+        $items[] = ['id' => 'p001', 'name' => '随机属性', 'type' => 'stat', 'stat_key' => 'random', 'amount_mode' => 'fixed', 'amount' => 1, 'min' => 1, 'max' => 1, 'weight' => 100, 'enabled' => true];
+    }
+    return ['enabled' => true, 'draw_mode' => 'weighted_random', 'items' => $items];
+}
+
+function normalizeTextPoolsFromPost() {
+    $ids = $_POST['text_pool_id'] ?? [];
+    $names = $_POST['text_pool_name'] ?? [];
+    $contents = $_POST['text_pool_items'] ?? [];
+    $deletes = $_POST['text_pool_delete'] ?? [];
+    $rows = max(count($ids), count($names), count($contents));
+    $pools = [];
+    for ($i = 0; $i < $rows; $i++) {
+        if (isset($deletes[$i])) continue;
+        $id = preg_replace('/[^A-Za-z0-9_\-]/', '', trim($ids[$i] ?? ''));
+        $name = trim($names[$i] ?? '');
+        $items = decodeLines($contents[$i] ?? '');
+        if ($id === '' && $name === '' && empty($items)) continue;
+        if ($id === '') $id = 'text_pool_' . time() . '_' . ($i + 1);
+        if ($name === '') $name = $id;
+        $pools[$id] = ['name' => $name, 'items' => $items];
+    }
+    if (empty($pools)) $pools['lantern_signs'] = ['name' => '灯签库', 'items' => []];
+    return $pools;
+}
+
+function normalizeLanternTaskConfigFromPost() {
+    return [
+        'enabled' => isset($_POST['lantern_task_enabled']),
+        'review_notify_group_id' => trim($_POST['review_notify_group_id'] ?? ''),
+        'review_admin_ids' => decodeLines(str_replace(['，', ','], "\n", $_POST['review_admin_ids'] ?? '')),
+        'expire_pending_on_close' => isset($_POST['expire_pending_on_close']),
+    ];
+}
+
 function getShopItemsForReward() {
     try {
         return getDB()->query("SELECT name, type, is_selling FROM items ORDER BY name")->fetchAll();
@@ -387,6 +518,22 @@ function flattenRecords($state, $q = '') {
     return $rows;
 }
 
+function taskStatusText($status) {
+    $map = [
+        'pending_completion' => '待完成',
+        'pending_review' => '待审核',
+        'approved' => '已通过',
+        'rejected' => '已驳回',
+        'expired' => '已过期',
+    ];
+    return $map[$status] ?? (string)$status;
+}
+
+function rewardTypeText($type) {
+    $map = ['stat' => '属性', 'currency' => '货币', 'item' => '物品', 'text' => '文字结果'];
+    return $map[$type] ?? (string)$type;
+}
+
 function exportActivityCsv($activity, $state, $type) {
     $filename = ($activity['activity_id'] ?? 'activity') . '_' . $type . '_' . date('Ymd_His') . '.csv';
     header('Content-Type: text/csv; charset=UTF-8');
@@ -403,6 +550,59 @@ function exportActivityCsv($activity, $state, $type) {
                 getUserNameSafe($uid),
                 implode('；', $archive['markers'] ?? []),
                 implode('；', $archive['followups'] ?? []),
+            ]);
+        }
+    } elseif ($type === 'reward_records') {
+        fputcsv($out, ['活动ID', '活动名称', 'QQ号', '用户名', '题目ID', '题面', '答案', '奖励ID', '奖励名称', '奖励类型', '奖励内容', '文字库ID', '文字库名称', '文字结果内容', '是否已入库', '可扣数量', '已被惩罚扣除数量', '抽取时间']);
+        foreach (($state['reward_records'] ?? []) as $row) {
+            fputcsv($out, [
+                $activity['activity_id'] ?? '',
+                $activity['name'] ?? '',
+                $row['user_id'] ?? '',
+                $row['user_name'] ?? getUserNameSafe($row['user_id'] ?? ''),
+                $row['riddle_id'] ?? '',
+                $row['riddle_prompt'] ?? '',
+                $row['riddle_answer'] ?? '',
+                $row['reward_id'] ?? '',
+                $row['reward_name'] ?? '',
+                rewardTypeText($row['reward_type'] ?? ''),
+                $row['reward_text'] ?? '',
+                $row['text_pool_id'] ?? '',
+                $row['text_pool_name'] ?? '',
+                $row['text_content'] ?? '',
+                !empty($row['stored']) ? '是' : '无需入库',
+                intval($row['deductible_amount'] ?? 0),
+                intval($row['deducted_amount'] ?? 0),
+                !empty($row['created_at']) ? date('Y-m-d H:i:s', intval($row['created_at'])) : '',
+            ]);
+        }
+    } elseif ($type === 'lantern_tasks') {
+        fputcsv($out, ['活动ID', '活动名称', '灯签记录ID', 'QQ号', '用户名', '题目ID', '题面', '答案', '奖励ID', '奖励名称', '文字库ID', '文字库名称', '灯签内容', '任务状态', '戏录编号', '审核奖励', '驳回原因', '过期惩罚', '审核人', '抽取时间', '提交时间', '审核时间', '过期时间']);
+        foreach (($state['lantern_tasks'] ?? []) as $row) {
+            fputcsv($out, [
+                $activity['activity_id'] ?? '',
+                $activity['name'] ?? '',
+                $row['task_id'] ?? '',
+                $row['user_id'] ?? '',
+                $row['user_name'] ?? getUserNameSafe($row['user_id'] ?? ''),
+                $row['riddle_id'] ?? '',
+                $row['riddle_prompt'] ?? '',
+                $row['riddle_answer'] ?? '',
+                $row['reward_id'] ?? '',
+                $row['reward_name'] ?? '',
+                $row['text_pool_id'] ?? '',
+                $row['text_pool_name'] ?? '',
+                $row['text_content'] ?? '',
+                taskStatusText($row['status'] ?? ''),
+                $row['drama_archive_id'] ?? '',
+                $row['review_reward_text'] ?? '',
+                $row['reject_reason'] ?? '',
+                $row['penalty_text'] ?? '',
+                $row['reviewer_id'] ?? '',
+                !empty($row['created_at']) ? date('Y-m-d H:i:s', intval($row['created_at'])) : '',
+                !empty($row['submitted_at']) ? date('Y-m-d H:i:s', intval($row['submitted_at'])) : '',
+                !empty($row['reviewed_at']) ? date('Y-m-d H:i:s', intval($row['reviewed_at'])) : '',
+                !empty($row['expired_at']) ? date('Y-m-d H:i:s', intval($row['expired_at'])) : '',
             ]);
         }
     } else {
@@ -464,7 +664,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $activity['lantern_riddle']['max_draws_per_user'] = max(0, intval($_POST['riddle_max'] ?? 5));
         $activity['servant_assignment']['enabled'] = isset($_POST['servant_enabled']);
         $activity['field_prompt']['max_draws_per_user'] = max(0, intval($_POST['prompt_max'] ?? 2));
-        $activity['lantern_riddle']['reward'] = normalizeGuessRewardFromPost();
+        $activity['lantern_task'] = normalizeLanternTaskConfigFromPost();
 
         if ($old_id && $old_id !== $aid) {
             unset($data['activities'][$old_id]);
@@ -502,7 +702,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $activity = $data['activities'][$aid];
             $activity['lantern_riddle']['enabled'] = isset($_POST['riddle_enabled']);
             $activity['lantern_riddle']['max_draws_per_user'] = max(0, intval($_POST['riddle_max'] ?? 5));
-            $activity['lantern_riddle']['reward'] = normalizeGuessRewardFromPost();
             $activity['lantern_riddle']['riddles'] = normalizeRiddlesFromPost(
                 $_POST['riddle_id'] ?? [],
                 $_POST['riddle_prompt'] ?? [],
@@ -517,6 +716,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         redirectTo(editUrl($aid, 'riddles'));
     }
 
+    if ($pa === 'save_reward_pool') {
+        $aid = trim($_POST['activity_id'] ?? '');
+        if (isset($data['activities'][$aid])) {
+            $activity = $data['activities'][$aid];
+            $activity['lantern_riddle']['guess_reward_pool'] = normalizeRewardPoolFromPost();
+            $data['activities'][$aid] = $activity;
+            saveActivitiesData($data);
+            logAction('activities', 'save_reward_pool', $aid, null, ['count' => count($activity['lantern_riddle']['guess_reward_pool']['items'] ?? [])]);
+            setFlash('success', '猜题奖池已保存');
+        }
+        redirectTo(editUrl($aid, 'reward-pool'));
+    }
+
+    if ($pa === 'save_text_pools') {
+        $aid = trim($_POST['activity_id'] ?? '');
+        if (isset($data['activities'][$aid])) {
+            $activity = $data['activities'][$aid];
+            $activity['text_pools'] = normalizeTextPoolsFromPost();
+            $data['activities'][$aid] = $activity;
+            saveActivitiesData($data);
+            logAction('activities', 'save_text_pools', $aid, null, ['count' => count($activity['text_pools'] ?? [])]);
+            setFlash('success', '文字库已保存');
+        }
+        redirectTo(editUrl($aid, 'text-pools'));
+    }
+
     if ($pa === 'save_fields') {
         $aid = trim($_POST['activity_id'] ?? '');
         if (isset($data['activities'][$aid])) {
@@ -526,18 +751,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             foreach (($_POST['fields'] ?? []) as $oldName => $fieldPost) {
                 $name = trim($fieldPost['name'] ?? $oldName);
                 if ($name === '') continue;
-                $existingField = $activity['fields'][$oldName] ?? [];
-                $fields[$name] = array_merge($existingField, [
+                $fields[$name] = [
                     'summary' => trim($fieldPost['summary'] ?? ''),
-                    'position' => decodeLines($fieldPost['position'] ?? ''),
-                    'participants' => decodeLines($fieldPost['participants'] ?? ''),
                     'plots' => decodeLines($fieldPost['plots'] ?? ''),
                     'stats' => decodeLines($fieldPost['stats'] ?? ''),
-                    'rewards' => decodeLines($fieldPost['rewards'] ?? ''),
-                    'consequences' => decodeLines($fieldPost['consequences'] ?? ''),
-                    'host_tip' => trim($fieldPost['host_tip'] ?? ''),
                     'prompts' => decodeLines($fieldPost['prompts'] ?? ''),
-                ]);
+                ];
             }
             $activity['fields'] = $fields;
             $data['activities'][$aid] = $activity;
@@ -736,6 +955,10 @@ if ($action === 'add') $edit = defaultActivity();
 if ($action === 'edit' && $id && isset($activities[$id])) $edit = $activities[$id];
 $editState = $edit ? readActivityState($edit['activity_id'] ?? '') : null;
 $guessReward = $edit ? normalizeGuessReward($edit['lantern_riddle']['reward'] ?? []) : normalizeGuessReward([]);
+$rewardPool = $edit ? ($edit['lantern_riddle']['guess_reward_pool']['items'] ?? []) : [];
+if ($edit && empty($rewardPool)) $rewardPool = [array_merge(['weight' => 100, 'enabled' => true, 'id' => 'legacy_reward', 'name' => '猜题奖励'], normalizeGuessReward($edit['lantern_riddle']['reward'] ?? []))];
+$textPools = $edit ? ($edit['text_pools'] ?? ['lantern_signs' => ['name' => '灯签库', 'items' => []]]) : [];
+$lanternTaskCfg = $edit ? ($edit['lantern_task'] ?? []) : [];
 $shopItems = getShopItemsForReward();
 $recordQuery = trim($_GET['q'] ?? '');
 $userMatches = $recordQuery !== '' ? searchUsersSafe($recordQuery) : [];
@@ -779,6 +1002,9 @@ require_once 'header.php';
   <div class="d-flex flex-wrap gap-2">
     <a class="btn btn-sm btn-outline-primary" href="#control">活动总控</a>
     <a class="btn btn-sm btn-outline-primary" href="#riddles">抽题/灯谜</a>
+    <a class="btn btn-sm btn-outline-primary" href="#reward-pool">猜题奖池</a>
+    <a class="btn btn-sm btn-outline-primary" href="#text-pools">文字库</a>
+    <a class="btn btn-sm btn-outline-primary" href="#lantern-tasks">灯签任务</a>
     <a class="btn btn-sm btn-outline-primary" href="#servants">公奴分配</a>
     <a class="btn btn-sm btn-outline-primary" href="#fields">场域与题面</a>
     <a class="btn btn-sm btn-outline-primary" href="#records">活动结算</a>
@@ -846,64 +1072,22 @@ require_once 'header.php';
       </div>
       <div class="col-12">
         <div class="border rounded-3 p-3 bg-light">
-          <div class="fw-semibold mb-2">猜题奖励</div>
+          <div class="fw-semibold mb-2">灯签审核提醒</div>
           <div class="row g-2">
-            <div class="col-md-2">
-              <label class="form-label small fw-semibold">奖励类型</label>
-              <select class="form-select" name="reward_type">
-                <?php foreach(['stat'=>'属性','currency'=>'货币','item'=>'物品'] as $k=>$v): ?>
-                <option value="<?php echo h($k); ?>" <?php echo ($guessReward['type'] ?? '')===$k?'selected':''; ?>><?php echo h($v); ?></option>
-                <?php endforeach; ?>
-              </select>
-            </div>
-            <div class="col-md-2">
-              <label class="form-label small fw-semibold">属性目标</label>
-              <select class="form-select" name="reward_stat_key">
-                <option value="random" <?php echo ($guessReward['stat_key'] ?? '')==='random'?'selected':''; ?>>随机属性</option>
-                <?php foreach(ALL_STAT_FIELDS as $sf): ?>
-                <option value="<?php echo h($sf); ?>" <?php echo ($guessReward['stat_key'] ?? '')===$sf?'selected':''; ?>><?php echo h(t($sf, $sf)); ?></option>
-                <?php endforeach; ?>
-              </select>
-            </div>
-            <div class="col-md-2">
-              <label class="form-label small fw-semibold">货币目标</label>
-              <select class="form-select" name="reward_currency_key">
-                <option value="yuCoin" <?php echo ($guessReward['currency_key'] ?? '')==='yuCoin'?'selected':''; ?>><?php echo h(t('term_yuCoin', '虞元')); ?></option>
-                <option value="reputation" <?php echo ($guessReward['currency_key'] ?? '')==='reputation'?'selected':''; ?>><?php echo h(t('term_reputation', '名誉')); ?></option>
-              </select>
-            </div>
             <div class="col-md-3">
-              <label class="form-label small fw-semibold">物品目标</label>
-              <select class="form-select" name="reward_item_name">
-                <option value="">选择已创建物品</option>
-                <?php foreach($shopItems as $item): ?>
-                <option value="<?php echo h($item['name']); ?>" <?php echo ($guessReward['item_name'] ?? '')===$item['name']?'selected':''; ?>><?php echo h($item['name']); ?><?php echo empty($item['is_selling']) ? '（下架）' : ''; ?></option>
-                <?php endforeach; ?>
-              </select>
+              <label class="form-label small fw-semibold">固定管理群号</label>
+              <input class="form-control" name="review_notify_group_id" value="<?php echo h($lanternTaskCfg['review_notify_group_id'] ?? ''); ?>">
             </div>
-            <div class="col-md-3">
-              <label class="form-label small fw-semibold">数值模式</label>
-              <select class="form-select" name="reward_amount_mode">
-                <option value="fixed" <?php echo ($guessReward['amount_mode'] ?? '')==='fixed'?'selected':''; ?>>固定数值</option>
-                <option value="random" <?php echo ($guessReward['amount_mode'] ?? '')==='random'?'selected':''; ?>>随机区间</option>
-              </select>
+            <div class="col-md-6">
+              <label class="form-label small fw-semibold">需要艾特的管理员 QQ <span class="text-muted">一行一个或逗号分隔</span></label>
+              <textarea class="form-control" name="review_admin_ids" rows="2"><?php echo h(implode("\n", $lanternTaskCfg['review_admin_ids'] ?? [])); ?></textarea>
             </div>
-            <div class="col-md-2">
-              <label class="form-label small fw-semibold">固定数值</label>
-              <input type="number" class="form-control" name="reward_amount" value="<?php echo intval($guessReward['amount'] ?? 1); ?>">
-            </div>
-            <div class="col-md-2">
-              <label class="form-label small fw-semibold">随机最小</label>
-              <input type="number" class="form-control" name="reward_min" value="<?php echo intval($guessReward['min'] ?? 1); ?>">
-            </div>
-            <div class="col-md-2">
-              <label class="form-label small fw-semibold">随机最大</label>
-              <input type="number" class="form-control" name="reward_max" value="<?php echo intval($guessReward['max'] ?? 1); ?>">
-            </div>
-            <div class="col-md-6 d-flex align-items-end">
-              <div class="small text-muted">选择物品奖励时，会从商店现有物品发放到玩家背包；可选择已下架但仍存在的物品。</div>
+            <div class="col-md-3 d-flex align-items-end gap-3 flex-wrap">
+              <label class="form-check mb-2"><input class="form-check-input" type="checkbox" name="lantern_task_enabled" <?php echo !empty($lanternTaskCfg['enabled'])?'checked':''; ?>> 开启灯签任务</label>
+              <label class="form-check mb-2"><input class="form-check-input" type="checkbox" name="expire_pending_on_close" <?php echo !empty($lanternTaskCfg['expire_pending_on_close'])?'checked':''; ?>> 支持过期扣罚</label>
             </div>
           </div>
+          <div class="small text-muted mt-2">用户私聊或群聊提交灯签后，机器人会向固定管理群发送审核提醒，并艾特这里配置的管理员。</div>
         </div>
       </div>
     </div>
@@ -932,62 +1116,8 @@ require_once 'header.php';
       <div class="col-md-3"><label class="form-label small fw-semibold">每人可抽次数</label><input type="number" class="form-control" name="riddle_max" value="<?php echo intval($edit['lantern_riddle']['max_draws_per_user'] ?? 5); ?>"></div>
       <div class="col-md-3 d-flex align-items-end"><label class="form-check mb-2"><input class="form-check-input" type="checkbox" name="riddle_enabled" <?php echo !empty($edit['lantern_riddle']['enabled'])?'checked':''; ?>> 开启抽题</label></div>
     </div>
-    <div class="border rounded-3 p-3 bg-light mb-3">
-      <div class="fw-semibold mb-2">猜题奖励</div>
-      <div class="row g-2">
-        <div class="col-md-2">
-          <label class="form-label small fw-semibold">奖励类型</label>
-          <select class="form-select" name="reward_type">
-            <?php foreach(['stat'=>'属性','currency'=>'货币','item'=>'物品'] as $k=>$v): ?>
-            <option value="<?php echo h($k); ?>" <?php echo ($guessReward['type'] ?? '')===$k?'selected':''; ?>><?php echo h($v); ?></option>
-            <?php endforeach; ?>
-          </select>
-        </div>
-        <div class="col-md-2">
-          <label class="form-label small fw-semibold">属性目标</label>
-          <select class="form-select" name="reward_stat_key">
-            <option value="random" <?php echo ($guessReward['stat_key'] ?? '')==='random'?'selected':''; ?>>随机属性</option>
-            <?php foreach(ALL_STAT_FIELDS as $sf): ?>
-            <option value="<?php echo h($sf); ?>" <?php echo ($guessReward['stat_key'] ?? '')===$sf?'selected':''; ?>><?php echo h(t($sf, $sf)); ?></option>
-            <?php endforeach; ?>
-          </select>
-        </div>
-        <div class="col-md-2">
-          <label class="form-label small fw-semibold">货币目标</label>
-          <select class="form-select" name="reward_currency_key">
-            <option value="yuCoin" <?php echo ($guessReward['currency_key'] ?? '')==='yuCoin'?'selected':''; ?>><?php echo h(t('term_yuCoin', '虞元')); ?></option>
-            <option value="reputation" <?php echo ($guessReward['currency_key'] ?? '')==='reputation'?'selected':''; ?>><?php echo h(t('term_reputation', '名誉')); ?></option>
-          </select>
-        </div>
-        <div class="col-md-3">
-          <label class="form-label small fw-semibold">物品目标</label>
-          <select class="form-select" name="reward_item_name">
-            <option value="">选择已创建物品</option>
-            <?php foreach($shopItems as $item): ?>
-            <option value="<?php echo h($item['name']); ?>" <?php echo ($guessReward['item_name'] ?? '')===$item['name']?'selected':''; ?>><?php echo h($item['name']); ?><?php echo empty($item['is_selling']) ? '（下架）' : ''; ?></option>
-            <?php endforeach; ?>
-          </select>
-        </div>
-        <div class="col-md-3">
-          <label class="form-label small fw-semibold">数值模式</label>
-          <select class="form-select" name="reward_amount_mode">
-            <option value="fixed" <?php echo ($guessReward['amount_mode'] ?? '')==='fixed'?'selected':''; ?>>固定数值</option>
-            <option value="random" <?php echo ($guessReward['amount_mode'] ?? '')==='random'?'selected':''; ?>>随机区间</option>
-          </select>
-        </div>
-        <div class="col-md-2">
-          <label class="form-label small fw-semibold">固定数值</label>
-          <input type="number" class="form-control" name="reward_amount" value="<?php echo intval($guessReward['amount'] ?? 1); ?>">
-        </div>
-        <div class="col-md-2">
-          <label class="form-label small fw-semibold">随机最小</label>
-          <input type="number" class="form-control" name="reward_min" value="<?php echo intval($guessReward['min'] ?? 1); ?>">
-        </div>
-        <div class="col-md-2">
-          <label class="form-label small fw-semibold">随机最大</label>
-          <input type="number" class="form-control" name="reward_max" value="<?php echo intval($guessReward['max'] ?? 1); ?>">
-        </div>
-      </div>
+    <div class="alert alert-light border small mb-3">
+      猜中奖励已改为独立奖池，请在下方【猜题奖池】模块配置属性、货币、物品或灯签文字结果。
     </div>
     <div class="table-responsive" style="max-height:520px">
       <table class="table table-sm table-bordered mini-table align-middle">
@@ -1026,6 +1156,9 @@ require_once 'header.php';
     </form>
   </div>
   <div class="card-body p-0">
+    <div class="px-3 py-2 small text-muted border-bottom">
+      状态文件：<code><?php echo h(activityStatePath($aid)); ?></code>。仅点击“清空本期灯谜记录”或“一键重置本期状态”会清空这里；如果更新 PHP 后变空，优先检查机器人和后台是否读同一个 <code>fanlong_activity/data</code> 目录。
+    </div>
     <table class="table table-sm mini-table mb-0">
       <thead class="table-active"><tr><th class="ps-3">玩家</th><th>抽题次数</th><th>已答对</th><th>最近题目</th></tr></thead>
       <tbody>
@@ -1036,6 +1169,120 @@ require_once 'header.php';
       </tbody>
     </table>
   </div>
+</div>
+
+<form method="POST" class="card ops-card mb-4" id="reward-pool">
+  <input type="hidden" name="action" value="save_reward_pool">
+  <input type="hidden" name="activity_id" value="<?php echo h($aid); ?>">
+  <div class="card-header"><i class="fas fa-gift me-2"></i>猜题奖池</div>
+  <div class="card-body">
+    <div class="alert alert-light border small">猜中灯谜后按权重抽取一个奖品。文字结果可绑定文字库，例如奖励名填“一条灯签”，文字库选择“灯签库”。</div>
+    <div id="rewardPoolRows" class="d-grid gap-3">
+      <?php $poolRows = array_values($rewardPool); ?>
+      <?php foreach($poolRows as $i=>$p): ?>
+      <div class="border rounded-3 p-3 reward-row" data-index="<?php echo $i; ?>">
+        <div class="row g-2">
+          <div class="col-md-1 d-flex align-items-end"><label class="form-check mb-2"><input class="form-check-input" type="checkbox" name="pool[enabled][<?php echo $i; ?>]" <?php echo !empty($p['enabled']) ? 'checked' : ''; ?>> 启用</label></div>
+          <div class="col-md-2"><label class="form-label small fw-semibold">ID</label><input class="form-control form-control-sm font-monospace bg-light" name="pool[id][<?php echo $i; ?>]" value="<?php echo h($p['id'] ?? ('p' . str_pad((string)($i + 1), 3, '0', STR_PAD_LEFT))); ?>" readonly></div>
+          <div class="col-md-2"><label class="form-label small fw-semibold">展示名称</label><input class="form-control form-control-sm" name="pool[name][<?php echo $i; ?>]" value="<?php echo h($p['name'] ?? ''); ?>" placeholder="一条灯签"></div>
+          <div class="col-md-2"><label class="form-label small fw-semibold">类型</label><select class="form-select form-select-sm js-reward-type" name="pool[type][<?php echo $i; ?>]"><?php foreach(['stat'=>'属性','currency'=>'货币','item'=>'物品','text'=>'文字结果'] as $k=>$v): ?><option value="<?php echo h($k); ?>" <?php echo (($p['type'] ?? 'stat')===$k?'selected':''); ?>><?php echo h($v); ?></option><?php endforeach; ?></select></div>
+          <div class="col-md-1"><label class="form-label small fw-semibold">权重</label><input type="number" class="form-control form-control-sm" name="pool[weight][<?php echo $i; ?>]" value="<?php echo intval($p['weight'] ?? 100); ?>"></div>
+          <div class="col-md-2 reward-field reward-field-stat"><label class="form-label small fw-semibold">属性</label><select class="form-select form-select-sm" name="pool[stat_key][<?php echo $i; ?>]"><option value="random" <?php echo (($p['stat_key'] ?? 'random')==='random'?'selected':''); ?>>随机</option><?php foreach(ALL_STAT_FIELDS as $sf): ?><option value="<?php echo h($sf); ?>" <?php echo (($p['stat_key'] ?? '')===$sf?'selected':''); ?>><?php echo h(t($sf, $sf)); ?></option><?php endforeach; ?></select></div>
+          <div class="col-md-2 reward-field reward-field-currency"><label class="form-label small fw-semibold">货币</label><select class="form-select form-select-sm" name="pool[currency_key][<?php echo $i; ?>]"><option value="yuCoin" <?php echo (($p['currency_key'] ?? '')==='yuCoin'?'selected':''); ?>>虞元</option><option value="reputation" <?php echo (($p['currency_key'] ?? '')==='reputation'?'selected':''); ?>>名誉</option></select></div>
+          <div class="col-md-3 reward-field reward-field-item"><label class="form-label small fw-semibold">物品</label><select class="form-select form-select-sm" name="pool[item_name][<?php echo $i; ?>]"><option value="">选择物品</option><?php foreach($shopItems as $item): ?><option value="<?php echo h($item['name']); ?>" <?php echo (($p['item_name'] ?? '')===$item['name']?'selected':''); ?>><?php echo h($item['name']); ?><?php echo empty($item['is_selling']) ? '（下架）' : ''; ?></option><?php endforeach; ?></select></div>
+          <div class="col-md-3 reward-field reward-field-text"><label class="form-label small fw-semibold">文字库</label><select class="form-select form-select-sm" name="pool[text_pool_id][<?php echo $i; ?>]"><option value="">选择文字库</option><?php foreach($textPools as $tid=>$pool): ?><option value="<?php echo h($tid); ?>" <?php echo (($p['text_pool_id'] ?? '')===$tid?'selected':''); ?>><?php echo h($pool['name'] ?? $tid); ?></option><?php endforeach; ?></select></div>
+          <div class="col-md-2 reward-amount-field"><label class="form-label small fw-semibold">数值模式</label><select class="form-select form-select-sm js-amount-mode" name="pool[amount_mode][<?php echo $i; ?>]"><option value="fixed" <?php echo (($p['amount_mode'] ?? '')==='fixed'?'selected':''); ?>>固定</option><option value="random" <?php echo (($p['amount_mode'] ?? '')==='random'?'selected':''); ?>>随机</option></select></div>
+          <div class="col-md-2 reward-amount-field amount-fixed"><label class="form-label small fw-semibold">固定数值</label><input type="number" class="form-control form-control-sm" name="pool[amount][<?php echo $i; ?>]" value="<?php echo intval($p['amount'] ?? 1); ?>"></div>
+          <div class="col-md-3 reward-amount-field amount-random"><label class="form-label small fw-semibold">随机区间</label><div class="d-flex gap-1"><input type="number" class="form-control form-control-sm" name="pool[min][<?php echo $i; ?>]" value="<?php echo intval($p['min'] ?? 1); ?>"><input type="number" class="form-control form-control-sm" name="pool[max][<?php echo $i; ?>]" value="<?php echo intval($p['max'] ?? 1); ?>"></div></div>
+          <div class="col-md-1 d-flex align-items-end"><button type="button" class="btn btn-sm btn-outline-danger js-remove-row w-100">删除</button></div>
+        </div>
+      </div>
+      <?php endforeach; ?>
+    </div>
+    <template id="rewardRowTemplate">
+      <div class="border rounded-3 p-3 reward-row" data-index="__INDEX__">
+        <div class="row g-2">
+          <div class="col-md-1 d-flex align-items-end"><label class="form-check mb-2"><input class="form-check-input" type="checkbox" name="pool[enabled][__INDEX__]" checked> 启用</label></div>
+          <div class="col-md-2"><label class="form-label small fw-semibold">ID</label><input class="form-control form-control-sm font-monospace bg-light js-auto-id" name="pool[id][__INDEX__]" readonly></div>
+          <div class="col-md-2"><label class="form-label small fw-semibold">展示名称</label><input class="form-control form-control-sm" name="pool[name][__INDEX__]" placeholder="一条灯签"></div>
+          <div class="col-md-2"><label class="form-label small fw-semibold">类型</label><select class="form-select form-select-sm js-reward-type" name="pool[type][__INDEX__]"><option value="stat">属性</option><option value="currency">货币</option><option value="item">物品</option><option value="text">文字结果</option></select></div>
+          <div class="col-md-1"><label class="form-label small fw-semibold">权重</label><input type="number" class="form-control form-control-sm" name="pool[weight][__INDEX__]" value="100"></div>
+          <div class="col-md-2 reward-field reward-field-stat"><label class="form-label small fw-semibold">属性</label><select class="form-select form-select-sm" name="pool[stat_key][__INDEX__]"><option value="random">随机</option><?php foreach(ALL_STAT_FIELDS as $sf): ?><option value="<?php echo h($sf); ?>"><?php echo h(t($sf, $sf)); ?></option><?php endforeach; ?></select></div>
+          <div class="col-md-2 reward-field reward-field-currency"><label class="form-label small fw-semibold">货币</label><select class="form-select form-select-sm" name="pool[currency_key][__INDEX__]"><option value="yuCoin">虞元</option><option value="reputation">名誉</option></select></div>
+          <div class="col-md-3 reward-field reward-field-item"><label class="form-label small fw-semibold">物品</label><select class="form-select form-select-sm" name="pool[item_name][__INDEX__]"><option value="">选择物品</option><?php foreach($shopItems as $item): ?><option value="<?php echo h($item['name']); ?>"><?php echo h($item['name']); ?><?php echo empty($item['is_selling']) ? '（下架）' : ''; ?></option><?php endforeach; ?></select></div>
+          <div class="col-md-3 reward-field reward-field-text"><label class="form-label small fw-semibold">文字库</label><select class="form-select form-select-sm" name="pool[text_pool_id][__INDEX__]"><option value="">选择文字库</option><?php foreach($textPools as $tid=>$pool): ?><option value="<?php echo h($tid); ?>"><?php echo h($pool['name'] ?? $tid); ?></option><?php endforeach; ?></select></div>
+          <div class="col-md-2 reward-amount-field"><label class="form-label small fw-semibold">数值模式</label><select class="form-select form-select-sm js-amount-mode" name="pool[amount_mode][__INDEX__]"><option value="fixed">固定</option><option value="random">随机</option></select></div>
+          <div class="col-md-2 reward-amount-field amount-fixed"><label class="form-label small fw-semibold">固定数值</label><input type="number" class="form-control form-control-sm" name="pool[amount][__INDEX__]" value="1"></div>
+          <div class="col-md-3 reward-amount-field amount-random"><label class="form-label small fw-semibold">随机区间</label><div class="d-flex gap-1"><input type="number" class="form-control form-control-sm" name="pool[min][__INDEX__]" value="1"><input type="number" class="form-control form-control-sm" name="pool[max][__INDEX__]" value="1"></div></div>
+          <div class="col-md-1 d-flex align-items-end"><button type="button" class="btn btn-sm btn-outline-danger js-remove-row w-100">删除</button></div>
+        </div>
+      </div>
+    </template>
+    <div class="small text-muted mt-2">展示名称用于机器人回复和导出，例如“奖励：一条灯签-签文内容”；ID 自动生成，仅用于配置识别。</div>
+    <button type="button" class="btn btn-outline-primary mt-3" id="addRewardRow"><i class="fas fa-plus me-1"></i>新增奖品</button>
+  </div>
+  <div class="card-footer text-end"><button class="btn btn-primary"><i class="fas fa-save me-1"></i>保存奖池</button></div>
+</form>
+
+<form method="POST" class="card ops-card mb-4" id="text-pools">
+  <input type="hidden" name="action" value="save_text_pools">
+  <input type="hidden" name="activity_id" value="<?php echo h($aid); ?>">
+  <div class="card-header"><i class="fas fa-scroll me-2"></i>文字结果库</div>
+  <div class="card-body">
+    <div class="field-grid" id="textPoolRows">
+      <?php $tpRows = $textPools; $i=0; foreach($tpRows as $tid=>$pool): ?>
+      <div class="border rounded-3 p-3 text-pool-row">
+        <label class="form-label small fw-semibold">文字库ID</label>
+        <input class="form-control mb-2 font-monospace bg-light" name="text_pool_id[<?php echo $i; ?>]" value="<?php echo h($tid ?: ('text_pool_' . ($i + 1))); ?>" readonly>
+        <label class="form-label small fw-semibold">文字库名称</label>
+        <input class="form-control mb-2" name="text_pool_name[<?php echo $i; ?>]" value="<?php echo h($pool['name'] ?? ''); ?>" placeholder="灯签库">
+        <label class="form-label small fw-semibold">内容 <span class="text-muted">一行一条</span></label>
+        <textarea class="form-control" rows="8" name="text_pool_items[<?php echo $i; ?>]"><?php echo h(implode("\n", $pool['items'] ?? [])); ?></textarea>
+        <button type="button" class="btn btn-sm btn-outline-danger mt-2 js-remove-row">删除文字库</button>
+      </div>
+      <?php $i++; endforeach; ?>
+    </div>
+    <template id="textPoolTemplate">
+      <div class="border rounded-3 p-3 text-pool-row">
+        <label class="form-label small fw-semibold">文字库ID</label>
+        <input class="form-control mb-2 font-monospace bg-light js-auto-id" name="text_pool_id[__INDEX__]" readonly>
+        <label class="form-label small fw-semibold">文字库名称</label>
+        <input class="form-control mb-2" name="text_pool_name[__INDEX__]" placeholder="灯签库">
+        <label class="form-label small fw-semibold">内容 <span class="text-muted">一行一条</span></label>
+        <textarea class="form-control" rows="8" name="text_pool_items[__INDEX__]"></textarea>
+        <button type="button" class="btn btn-sm btn-outline-danger mt-2 js-remove-row">删除文字库</button>
+      </div>
+    </template>
+    <div class="small text-muted mt-2">文字库 ID 自动生成，仅用于奖池绑定；展示给玩家的是文字库名称和抽中的文本。</div>
+  </div>
+  <div class="card-footer d-flex justify-content-between align-items-center">
+    <button type="button" class="btn btn-outline-primary" id="addTextPoolRow"><i class="fas fa-plus me-1"></i>新增文字库</button>
+    <button class="btn btn-primary"><i class="fas fa-save me-1"></i>保存文字库</button>
+  </div>
+</form>
+
+<div class="card ops-card mb-4" id="lantern-tasks">
+  <div class="card-header"><i class="fas fa-clipboard-check me-2"></i>灯签任务记录</div>
+  <div class="card-body p-0">
+    <table class="table table-sm mini-table align-middle mb-0">
+      <thead class="table-active"><tr><th class="ps-3">记录</th><th>玩家</th><th>灯签</th><th>状态</th><th>戏录编号</th><th>审核/惩罚</th><th>时间</th></tr></thead>
+      <tbody>
+      <?php foreach(($state['lantern_tasks'] ?? []) as $task): ?>
+        <tr>
+          <td class="ps-3">#<?php echo h($task['task_id'] ?? ''); ?></td>
+          <td><?php echo h($task['user_name'] ?? getUserNameSafe($task['user_id'] ?? '')); ?><br><code><?php echo h($task['user_id'] ?? ''); ?></code></td>
+          <td><?php echo h($task['text_content'] ?? ''); ?><br><span class="text-muted"><?php echo h($task['text_pool_name'] ?? ''); ?></span></td>
+          <td><span class="badge bg-secondary"><?php echo h(taskStatusText($task['status'] ?? '')); ?></span></td>
+          <td><?php echo h($task['drama_archive_id'] ?? '-'); ?></td>
+          <td><span class="text-muted">奖励：</span><?php echo h($task['review_reward_text'] ?? ''); ?><br><span class="text-muted">惩罚：</span><?php echo h($task['penalty_text'] ?? ''); ?></td>
+          <td><?php echo !empty($task['created_at']) ? date('Y-m-d H:i', intval($task['created_at'])) : '-'; ?></td>
+        </tr>
+      <?php endforeach; ?>
+      <?php if(empty($state['lantern_tasks'])): ?><tr><td colspan="7" class="text-center text-muted py-4">暂无灯签任务</td></tr><?php endif; ?>
+      </tbody>
+    </table>
+  </div>
+  <div class="card-footer small text-muted">审核与过期扣罚由机器人口令执行：灯签待审核 / 灯签通过 / 灯签驳回 / 灯签过期。</div>
 </div>
 
 <div class="card ops-card mb-4" id="servants">
@@ -1101,35 +1348,49 @@ require_once 'header.php';
     <div class="row g-3 mb-3">
       <div class="col-md-3"><label class="form-label small fw-semibold">每人题面抽取次数</label><input type="number" class="form-control" name="prompt_max" value="<?php echo intval($edit['field_prompt']['max_draws_per_user'] ?? 2); ?>"></div>
     </div>
-    <div class="field-grid">
+    <div class="field-grid" id="fieldRows">
     <?php foreach($fields as $fname=>$field): ?>
-      <div class="border rounded-3 p-3">
+      <div class="border rounded-3 p-3 field-row">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="fw-semibold small">场域配置</div>
+          <button type="button" class="btn btn-sm btn-outline-danger js-remove-row">删除场域</button>
+        </div>
         <label class="form-label small fw-semibold">场域名称</label>
-        <input class="form-control mb-2" name="fields[<?php echo h($fname); ?>][name]" value="<?php echo h($fname); ?>">
-        <label class="form-label small fw-semibold">说明</label>
+        <input class="form-control mb-2" name="fields[<?php echo h($fname); ?>][name]" value="<?php echo h($fname); ?>" placeholder="新增场域">
+        <label class="form-label small fw-semibold">场域简介</label>
         <textarea class="form-control textarea-sm mb-2" name="fields[<?php echo h($fname); ?>][summary]"><?php echo h($field['summary'] ?? ''); ?></textarea>
-        <label class="form-label small fw-semibold">定位 <span class="text-muted">一行一条</span></label>
-        <textarea class="form-control textarea-sm mb-2" name="fields[<?php echo h($fname); ?>][position]"><?php echo h(implode("\n", $field['position'] ?? [])); ?></textarea>
-        <label class="form-label small fw-semibold">参与人群</label>
-        <textarea class="form-control textarea-sm mb-2" name="fields[<?php echo h($fname); ?>][participants]"><?php echo h(implode("\n", $field['participants'] ?? [])); ?></textarea>
         <label class="form-label small fw-semibold">可写剧情</label>
         <textarea class="form-control textarea-sm mb-2" name="fields[<?php echo h($fname); ?>][plots]"><?php echo h(implode("\n", $field['plots'] ?? [])); ?></textarea>
         <label class="form-label small fw-semibold">判定属性</label>
         <textarea class="form-control textarea-sm mb-2" name="fields[<?php echo h($fname); ?>][stats]"><?php echo h(implode("\n", $field['stats'] ?? [])); ?></textarea>
-        <label class="form-label small fw-semibold">奖励</label>
-        <textarea class="form-control textarea-sm mb-2" name="fields[<?php echo h($fname); ?>][rewards]"><?php echo h(implode("\n", $field['rewards'] ?? [])); ?></textarea>
-        <label class="form-label small fw-semibold">失败后果</label>
-        <textarea class="form-control textarea-sm mb-2" name="fields[<?php echo h($fname); ?>][consequences]"><?php echo h(implode("\n", $field['consequences'] ?? [])); ?></textarea>
-        <label class="form-label small fw-semibold">主持人提示</label>
-        <textarea class="form-control textarea-sm mb-2" name="fields[<?php echo h($fname); ?>][host_tip]"><?php echo h($field['host_tip'] ?? ''); ?></textarea>
         <label class="form-label small fw-semibold">开戏题面库 <span class="text-muted">一行一条</span></label>
         <textarea class="form-control" rows="10" name="fields[<?php echo h($fname); ?>][prompts]"><?php echo h(implode("\n", $field['prompts'] ?? [])); ?></textarea>
       </div>
     <?php endforeach; ?>
-    <?php if(empty($fields)): ?><div class="text-muted">暂无场域，可在高级 JSON 中初始化。</div><?php endif; ?>
     </div>
+    <template id="fieldRowTemplate">
+      <div class="border rounded-3 p-3 field-row">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="fw-semibold small">场域配置</div>
+          <button type="button" class="btn btn-sm btn-outline-danger js-remove-row">删除场域</button>
+        </div>
+        <label class="form-label small fw-semibold">场域名称</label>
+        <input class="form-control mb-2" name="fields[__KEY__][name]" placeholder="新增场域">
+        <label class="form-label small fw-semibold">场域简介</label>
+        <textarea class="form-control textarea-sm mb-2" name="fields[__KEY__][summary]"></textarea>
+        <label class="form-label small fw-semibold">可写剧情</label>
+        <textarea class="form-control textarea-sm mb-2" name="fields[__KEY__][plots]"></textarea>
+        <label class="form-label small fw-semibold">判定属性</label>
+        <textarea class="form-control textarea-sm mb-2" name="fields[__KEY__][stats]"></textarea>
+        <label class="form-label small fw-semibold">开戏题面库 <span class="text-muted">一行一条</span></label>
+        <textarea class="form-control" rows="10" name="fields[__KEY__][prompts]"></textarea>
+      </div>
+    </template>
   </div>
-  <div class="card-footer text-end"><button class="btn btn-primary"><i class="fas fa-save me-1"></i>保存场域与题面</button></div>
+  <div class="card-footer d-flex justify-content-between align-items-center">
+    <button type="button" class="btn btn-outline-primary" id="addFieldRow"><i class="fas fa-plus me-1"></i>新增场域</button>
+    <button class="btn btn-primary"><i class="fas fa-save me-1"></i>保存场域与题面</button>
+  </div>
 </form>
 
 <div class="card ops-card mb-4" id="prompt-records">
@@ -1226,6 +1487,8 @@ require_once 'header.php';
   <div class="card-body d-flex flex-wrap gap-2">
     <a class="btn btn-outline-success" href="activities.php?action=edit&id=<?php echo urlencode($aid); ?>&export=settlements">导出本期结算记录</a>
     <a class="btn btn-outline-success" href="activities.php?action=edit&id=<?php echo urlencode($aid); ?>&export=markers">导出标记/后续列表</a>
+    <a class="btn btn-outline-success" href="activities.php?action=edit&id=<?php echo urlencode($aid); ?>&export=reward_records">导出猜题领奖记录</a>
+    <a class="btn btn-outline-success" href="activities.php?action=edit&id=<?php echo urlencode($aid); ?>&export=lantern_tasks">导出灯签任务记录</a>
     <span class="text-muted small align-self-center">CSV 可直接给管理写余波总结。</span>
   </div>
 </div>
@@ -1241,6 +1504,94 @@ require_once 'header.php';
     <button class="btn btn-outline-warning"><i class="fas fa-code me-1"></i>保存 JSON</button>
   </div>
 </form>
+
+<script>
+(function() {
+  function updateRewardRow(row) {
+    var typeEl = row.querySelector('.js-reward-type');
+    var modeEl = row.querySelector('.js-amount-mode');
+    var type = typeEl ? typeEl.value : 'stat';
+    var mode = modeEl ? modeEl.value : 'fixed';
+    row.querySelectorAll('.reward-field').forEach(function(el) { el.classList.add('d-none'); });
+    row.querySelectorAll('.reward-field-' + type).forEach(function(el) { el.classList.remove('d-none'); });
+    row.querySelectorAll('.reward-amount-field').forEach(function(el) {
+      el.classList.toggle('d-none', type === 'text');
+    });
+    row.querySelectorAll('.amount-fixed').forEach(function(el) {
+      el.classList.toggle('d-none', type === 'text' || mode !== 'fixed');
+    });
+    row.querySelectorAll('.amount-random').forEach(function(el) {
+      el.classList.toggle('d-none', type === 'text' || mode !== 'random');
+    });
+  }
+
+  function bindRewardRow(row) {
+    row.querySelectorAll('.js-reward-type, .js-amount-mode').forEach(function(el) {
+      el.addEventListener('change', function() { updateRewardRow(row); });
+    });
+    updateRewardRow(row);
+  }
+
+  function bindRemoveButtons(scope) {
+    scope.querySelectorAll('.js-remove-row').forEach(function(btn) {
+      if (btn.dataset.bound === '1') return;
+      btn.dataset.bound = '1';
+      btn.addEventListener('click', function() {
+        var row = btn.closest('.reward-row, .text-pool-row, .field-row');
+        if (row) row.remove();
+      });
+    });
+  }
+
+  function makeId(prefix) {
+    return prefix + '_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1000).toString(36);
+  }
+
+  document.querySelectorAll('.reward-row').forEach(bindRewardRow);
+  bindRemoveButtons(document);
+
+  var addReward = document.getElementById('addRewardRow');
+  if (addReward) {
+    addReward.addEventListener('click', function() {
+      var tpl = document.getElementById('rewardRowTemplate');
+      var target = document.getElementById('rewardPoolRows');
+      var index = Date.now();
+      var html = tpl.innerHTML.replace(/__INDEX__/g, index);
+      target.insertAdjacentHTML('beforeend', html);
+      var row = target.lastElementChild;
+      var idInput = row.querySelector('.js-auto-id');
+      if (idInput) idInput.value = makeId('p');
+      bindRewardRow(row);
+      bindRemoveButtons(row);
+    });
+  }
+
+  var addTextPool = document.getElementById('addTextPoolRow');
+  if (addTextPool) {
+    addTextPool.addEventListener('click', function() {
+      var tpl = document.getElementById('textPoolTemplate');
+      var target = document.getElementById('textPoolRows');
+      var index = Date.now();
+      target.insertAdjacentHTML('beforeend', tpl.innerHTML.replace(/__INDEX__/g, index));
+      var row = target.lastElementChild;
+      var idInput = row.querySelector('.js-auto-id');
+      if (idInput) idInput.value = makeId('text_pool');
+      bindRemoveButtons(row);
+    });
+  }
+
+  var addField = document.getElementById('addFieldRow');
+  if (addField) {
+    addField.addEventListener('click', function() {
+      var tpl = document.getElementById('fieldRowTemplate');
+      var target = document.getElementById('fieldRows');
+      var key = '__new_' + Date.now();
+      target.insertAdjacentHTML('beforeend', tpl.innerHTML.replace(/__KEY__/g, key));
+      bindRemoveButtons(target.lastElementChild);
+    });
+  }
+})();
+</script>
 
 <?php else: ?>
 <div class="d-flex justify-content-between align-items-center mb-3">
@@ -1277,6 +1628,8 @@ require_once 'header.php';
         </td>
         <td class="small text-muted">
           灯谜 <?php echo $stats['riddles']; ?> /
+          领奖 <?php echo $stats['rewards']; ?> /
+          灯签 <?php echo $stats['lantern_tasks']; ?> /
           题面 <?php echo $stats['prompts']; ?> /
           报名 <?php echo $stats['servants']; ?> /
           分配 <?php echo $stats['assignments']; ?> /
