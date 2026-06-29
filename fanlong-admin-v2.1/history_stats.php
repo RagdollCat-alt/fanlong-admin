@@ -13,13 +13,102 @@ $filter_to    = trim($_GET['date_to']    ?? '');
 $page         = max(1, intval($_GET['p'] ?? 1));
 $page_size    = 50;
 
+function buildHistoryStatsQuery($filter_user, $filter_group, $filter_from, $filter_to) {
+    $sql = "SELECT h.*, u.name as user_name FROM history_stats h LEFT JOIN users u ON h.user_id=u.id WHERE 1=1";
+    $params = [];
+    if ($filter_user)  { $sql .= " AND (h.user_id LIKE ? OR u.name LIKE ?)"; $params[] = "%$filter_user%"; $params[] = "%$filter_user%"; }
+    if ($filter_group) { $sql .= " AND h.group_id=?"; $params[] = $filter_group; }
+    if ($filter_from)  { $sql .= " AND h.date >= ?"; $params[] = $filter_from; }
+    if ($filter_to)    { $sql .= " AND h.date <= ?"; $params[] = $filter_to; }
+    return [$sql, $params];
+}
+
+function xlsCell($value) {
+    if ($value === null || $value === '') return '';
+    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
+}
+
+function exportHistoryStatsXls($db, $filter_user, $filter_group, $filter_from, $filter_to) {
+    [$sql, $params] = buildHistoryStatsQuery($filter_user, $filter_group, $filter_from, $filter_to);
+    $sql .= " ORDER BY h.date DESC, h.word_count DESC, h.id DESC";
+    $stmt = $db->prepare($sql);
+    $stmt->execute($params);
+    $rows = $stmt->fetchAll();
+
+    logAction('history_stats', 'view', 'export_xls', null, [
+        'user' => $filter_user,
+        'group' => $filter_group,
+        'date_from' => $filter_from,
+        'date_to' => $filter_to,
+        'count' => count($rows),
+    ]);
+
+    $filename = 'history_stats_' . date('Ymd_His') . '.xls';
+    header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Cache-Control: max-age=0');
+    echo "\xEF\xBB\xBF";
+    ?>
+<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid #999; padding: 6px 10px; }
+    th { background: #e9ecef; font-weight: bold; }
+    .text { mso-number-format:"\@"; }
+    .number { mso-number-format:"0"; }
+  </style>
+</head>
+<body>
+  <h3>繁笼历史统计导出</h3>
+  <table>
+    <tr><th>导出时间</th><td class="text"><?php echo xlsCell(date('Y-m-d H:i:s')); ?></td></tr>
+    <tr><th>用户筛选</th><td class="text"><?php echo xlsCell($filter_user ?: '全部'); ?></td></tr>
+    <tr><th>群组筛选</th><td class="text"><?php echo xlsCell($filter_group ?: '全部'); ?></td></tr>
+    <tr><th>日期范围</th><td class="text"><?php echo xlsCell(($filter_from ?: '不限') . ' 至 ' . ($filter_to ?: '不限')); ?></td></tr>
+    <tr><th>记录数</th><td class="number"><?php echo count($rows); ?></td></tr>
+  </table>
+  <br>
+  <table>
+    <thead>
+      <tr>
+        <th>日期</th>
+        <th>用户</th>
+        <th>QQ号</th>
+        <th>群组</th>
+        <th>字数</th>
+        <th>行数</th>
+        <th>记录时间</th>
+      </tr>
+    </thead>
+    <tbody>
+      <?php foreach ($rows as $r): ?>
+      <tr>
+        <td class="text"><?php echo xlsCell($r['date']); ?></td>
+        <td class="text"><?php echo xlsCell($r['user_name'] ?: $r['user_id']); ?></td>
+        <td class="text"><?php echo xlsCell($r['user_id']); ?></td>
+        <td class="text"><?php echo xlsCell($r['group_id']); ?></td>
+        <td class="number"><?php echo intval($r['word_count']); ?></td>
+        <td class="number"><?php echo intval($r['line_count']); ?></td>
+        <td class="text"><?php echo xlsCell($r['created_at']); ?></td>
+      </tr>
+      <?php endforeach; ?>
+    </tbody>
+  </table>
+</body>
+</html>
+    <?php
+    exit();
+}
+
 // 基础查询
-$sql    = "SELECT h.*, u.name as user_name FROM history_stats h LEFT JOIN users u ON h.user_id=u.id WHERE 1=1";
-$params = [];
-if ($filter_user)  { $sql .= " AND (h.user_id LIKE ? OR u.name LIKE ?)"; $params[] = "%$filter_user%"; $params[] = "%$filter_user%"; }
-if ($filter_group) { $sql .= " AND h.group_id=?"; $params[] = $filter_group; }
-if ($filter_from)  { $sql .= " AND h.date >= ?"; $params[] = $filter_from; }
-if ($filter_to)    { $sql .= " AND h.date <= ?"; $params[] = $filter_to; }
+[$sql, $params] = buildHistoryStatsQuery($filter_user, $filter_group, $filter_from, $filter_to);
+
+if (($_GET['export'] ?? '') === 'xls') {
+    exportHistoryStatsXls($db, $filter_user, $filter_group, $filter_from, $filter_to);
+}
 
 $cnt_stmt = $db->prepare(str_replace("SELECT h.*, u.name as user_name","SELECT COUNT(*)",$sql));
 $cnt_stmt->execute($params);
@@ -38,6 +127,9 @@ $top_users = $db->query("SELECT h.user_id, u.name, SUM(h.word_count) as total_wo
 
 // 所有群号
 $all_groups = $db->query("SELECT DISTINCT group_id FROM history_stats WHERE group_id!='' ORDER BY group_id")->fetchAll(PDO::FETCH_COLUMN, 0);
+$export_query = $_GET;
+unset($export_query['p']);
+$export_query['export'] = 'xls';
 
 $page_title    = '历史统计';
 $page_icon     = 'fas fa-chart-area';
@@ -142,6 +234,9 @@ require_once 'header.php';
           <div class="col-md-4 d-flex align-items-end gap-2">
             <button type="submit" class="btn btn-sm btn-primary flex-grow-1"><i class="fas fa-search me-1"></i>查询</button>
             <a href="history_stats.php" class="btn btn-sm btn-outline-secondary">重置</a>
+            <button type="submit" name="export" value="xls" class="btn btn-sm btn-outline-success">
+              <i class="fas fa-file-excel me-1"></i>导出
+            </button>
           </div>
         </form>
       </div>
@@ -153,7 +248,12 @@ require_once 'header.php';
 <div class="card">
   <div class="card-header d-flex justify-content-between">
     <span><i class="fas fa-list me-2"></i>明细记录（共 <?php echo number_format($total); ?> 条）</span>
-    <span class="text-muted small">第 <?php echo $page; ?>/<?php echo $total_pages; ?> 页</span>
+    <span class="d-flex align-items-center gap-2">
+      <a class="btn btn-sm btn-outline-success" href="?<?php echo htmlspecialchars(http_build_query($export_query)); ?>">
+        <i class="fas fa-file-excel me-1"></i>导出 Excel
+      </a>
+      <span class="text-muted small">第 <?php echo $page; ?>/<?php echo $total_pages; ?> 页</span>
+    </span>
   </div>
   <div class="card-body p-0">
     <div class="table-responsive">

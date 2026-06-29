@@ -387,14 +387,15 @@ function normalizeRewardPoolItemFromArrays($i, $data) {
 
 function normalizeRewardPoolFromPost() {
     $data = $_POST['pool'] ?? [];
-    $rows = max(
-        count($data['id'] ?? []),
-        count($data['name'] ?? []),
-        count($data['type'] ?? [])
-    );
+    $rowKeys = [];
+    foreach (['id', 'name', 'type', 'weight', 'enabled', 'amount_mode', 'amount', 'min', 'max', 'stat_key', 'currency_key', 'item_name', 'text_pool_id', 'delete'] as $field) {
+        foreach (array_keys($data[$field] ?? []) as $key) {
+            $rowKeys[(string)$key] = $key;
+        }
+    }
     $items = [];
     $used = [];
-    for ($i = 0; $i < $rows; $i++) {
+    foreach ($rowKeys as $i) {
         if (!empty($data['delete'][$i])) continue;
         $item = normalizeRewardPoolItemFromArrays($i, $data);
         if (!$item) continue;
@@ -420,9 +421,14 @@ function normalizeTextPoolsFromPost() {
     $names = $_POST['text_pool_name'] ?? [];
     $contents = $_POST['text_pool_items'] ?? [];
     $deletes = $_POST['text_pool_delete'] ?? [];
-    $rows = max(count($ids), count($names), count($contents));
+    $rowKeys = [];
+    foreach ([$ids, $names, $contents, $deletes] as $arr) {
+        foreach (array_keys($arr ?? []) as $key) {
+            $rowKeys[(string)$key] = $key;
+        }
+    }
     $pools = [];
-    for ($i = 0; $i < $rows; $i++) {
+    foreach ($rowKeys as $i) {
         if (isset($deletes[$i])) continue;
         $id = preg_replace('/[^A-Za-z0-9_\-]/', '', trim($ids[$i] ?? ''));
         $name = trim($names[$i] ?? '');
@@ -443,6 +449,28 @@ function normalizeLanternTaskConfigFromPost() {
         'review_admin_ids' => decodeLines(str_replace(['，', ','], "\n", $_POST['review_admin_ids'] ?? '')),
         'expire_pending_on_close' => isset($_POST['expire_pending_on_close']),
     ];
+}
+
+function buildRewardText($label, $content) {
+    $label = trim((string)$label);
+    $content = trim((string)$content);
+    if ($label === '') return $content;
+    if ($content === '') return $label;
+    return $label . '-' . $content;
+}
+
+function syncLanternTaskRewardRecord(&$state, $task, $content, $operator) {
+    $recordId = (string)($task['reward_record_id'] ?? '');
+    if ($recordId === '') return;
+    foreach (($state['reward_records'] ?? []) as $idx => $record) {
+        if ((string)($record['record_id'] ?? '') !== $recordId) continue;
+        $label = $record['reward_name'] ?? ($task['reward_name'] ?? ($record['reward_label'] ?? ''));
+        $state['reward_records'][$idx]['text_content'] = $content;
+        $state['reward_records'][$idx]['reward_text'] = buildRewardText($label, $content);
+        $state['reward_records'][$idx]['text_content_updated_by'] = $operator;
+        $state['reward_records'][$idx]['text_content_updated_at'] = time();
+        break;
+    }
 }
 
 function getShopItemsForReward() {
@@ -794,6 +822,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         logAction('activities', 'clear_prompts', $aid);
         setFlash('success', '本期题面抽取记录已清空');
         redirectTo(editUrl($aid, 'prompt-records'));
+    }
+
+    if ($pa === 'save_lantern_tasks') {
+        $aid = trim($_POST['activity_id'] ?? '');
+        $taskIds = $_POST['lantern_task_ids'] ?? [];
+        $contents = $_POST['lantern_task_content'] ?? [];
+        $state = readActivityState($aid);
+        $operator = $_SESSION['admin_id'] ?? 'admin';
+        $changed = 0;
+
+        foreach (($state['lantern_tasks'] ?? []) as $idx => $task) {
+            $taskId = (string)($task['task_id'] ?? '');
+            if ($taskId === '' || !in_array($taskId, array_map('strval', $taskIds), true)) continue;
+            $oldContent = (string)($task['text_content'] ?? '');
+            $newContent = trim((string)($contents[$taskId] ?? ''));
+            if ($newContent === $oldContent) continue;
+            $state['lantern_tasks'][$idx]['text_content'] = $newContent;
+            $state['lantern_tasks'][$idx]['text_content_updated_by'] = $operator;
+            $state['lantern_tasks'][$idx]['text_content_updated_at'] = time();
+            syncLanternTaskRewardRecord($state, $state['lantern_tasks'][$idx], $newContent, $operator);
+            $changed++;
+        }
+
+        saveActivityState($aid, $state);
+        logAction('activities', 'save_lantern_tasks', $aid, null, ['changed' => $changed]);
+        setFlash('success', $changed > 0 ? "已修改 {$changed} 条灯签内容" : '灯签内容没有变化');
+        redirectTo(editUrl($aid, 'lantern-tasks'));
     }
 
     if ($pa === 'remove_servant') {
@@ -1261,29 +1316,48 @@ require_once 'header.php';
   </div>
 </form>
 
-<div class="card ops-card mb-4" id="lantern-tasks">
-  <div class="card-header"><i class="fas fa-clipboard-check me-2"></i>灯签任务记录</div>
+<form method="POST" class="card ops-card mb-4" id="lantern-tasks">
+  <input type="hidden" name="action" value="save_lantern_tasks">
+  <input type="hidden" name="activity_id" value="<?php echo h($aid); ?>">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span><i class="fas fa-clipboard-check me-2"></i>灯签任务记录</span>
+    <span class="badge bg-secondary"><?php echo count($state['lantern_tasks'] ?? []); ?> 条</span>
+  </div>
   <div class="card-body p-0">
     <table class="table table-sm mini-table align-middle mb-0">
       <thead class="table-active"><tr><th class="ps-3">记录</th><th>玩家</th><th>灯签</th><th>状态</th><th>戏录编号</th><th>审核/惩罚</th><th>时间</th></tr></thead>
       <tbody>
       <?php foreach(($state['lantern_tasks'] ?? []) as $task): ?>
+        <?php $taskId = (string)($task['task_id'] ?? ''); ?>
         <tr>
-          <td class="ps-3">#<?php echo h($task['task_id'] ?? ''); ?></td>
+          <td class="ps-3">#<?php echo h($taskId); ?><input type="hidden" name="lantern_task_ids[]" value="<?php echo h($taskId); ?>"></td>
           <td><?php echo h($task['user_name'] ?? getUserNameSafe($task['user_id'] ?? '')); ?><br><code><?php echo h($task['user_id'] ?? ''); ?></code></td>
-          <td><?php echo h($task['text_content'] ?? ''); ?><br><span class="text-muted"><?php echo h($task['text_pool_name'] ?? ''); ?></span></td>
+          <td style="min-width:280px">
+            <?php if(can('activities','edit')): ?>
+              <textarea class="form-control form-control-sm" rows="2" name="lantern_task_content[<?php echo h($taskId); ?>]"><?php echo h($task['text_content'] ?? ''); ?></textarea>
+            <?php else: ?>
+              <?php echo h($task['text_content'] ?? ''); ?>
+            <?php endif; ?>
+            <div class="text-muted mt-1"><?php echo h($task['text_pool_name'] ?? ''); ?></div>
+          </td>
           <td><span class="badge bg-secondary"><?php echo h(taskStatusText($task['status'] ?? '')); ?></span></td>
           <td><?php echo h($task['drama_archive_id'] ?? '-'); ?></td>
           <td><span class="text-muted">奖励：</span><?php echo h($task['review_reward_text'] ?? ''); ?><br><span class="text-muted">惩罚：</span><?php echo h($task['penalty_text'] ?? ''); ?></td>
-          <td><?php echo !empty($task['created_at']) ? date('Y-m-d H:i', intval($task['created_at'])) : '-'; ?></td>
+          <td>
+            <span class="text-muted">抽取：</span><?php echo !empty($task['created_at']) ? date('Y-m-d H:i', intval($task['created_at'])) : '-'; ?>
+            <?php if(!empty($task['text_content_updated_at'])): ?><br><span class="text-muted">改签：</span><?php echo date('Y-m-d H:i', intval($task['text_content_updated_at'])); ?><?php endif; ?>
+          </td>
         </tr>
       <?php endforeach; ?>
       <?php if(empty($state['lantern_tasks'])): ?><tr><td colspan="7" class="text-center text-muted py-4">暂无灯签任务</td></tr><?php endif; ?>
       </tbody>
     </table>
   </div>
-  <div class="card-footer small text-muted">审核与过期扣罚由机器人口令执行：灯签待审核 / 灯签通过 / 灯签驳回 / 灯签过期。</div>
-</div>
+  <div class="card-footer d-flex justify-content-between align-items-center">
+    <span class="small text-muted">改签后，玩家回复“我的灯签”和管理查看灯签列表都会显示新内容。</span>
+    <?php if(can('activities','edit')): ?><button class="btn btn-primary"><i class="fas fa-save me-1"></i>保存灯签内容</button><?php endif; ?>
+  </div>
+</form>
 
 <div class="card ops-card mb-4" id="servants">
   <div class="card-header d-flex justify-content-between align-items-center">
